@@ -1,0 +1,20 @@
+# 基础数据处理库
+pandas==2.2.3
+numpy==2.2.6
+
+# 交易API和数据获取
+pytdx>=1.72
+baostock>=0.8.8
+
+# 进度条显示
+tqdm>=4.65.0
+
+# HTTP请求
+requests==2.32.3
+
+# 日期时间处理
+python-dateutil==2.9.0.post0
+pytz==2025.2
+
+# 项目特定依赖
+# xtquant为本地包，不通过pip安装
