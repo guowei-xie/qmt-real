@@ -226,7 +226,7 @@ def remove_stock_suffix(codes):
 
     return stock_code
 
-def get_szzs_stock_code(self):
+def get_szzs_stock_code():
     """
     获取上证指数代码
     
@@ -236,7 +236,7 @@ def get_szzs_stock_code(self):
     return '000001.SH'
 
 
-def get_szcz_stock_code(self):
+def get_szcz_stock_code():
     """
     获取深证成指代码
     
@@ -246,7 +246,7 @@ def get_szcz_stock_code(self):
     return '399001.SZ'
 
 
-def get_cybz_stock_code(self):
+def get_cybz_stock_code():
     """
     获取创业板指代码
     

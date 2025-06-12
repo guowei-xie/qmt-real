@@ -28,6 +28,7 @@ logs/
 
 # Local configuration
 config.local.ini
+config.py
 
 # Temporary files
 *.tmp

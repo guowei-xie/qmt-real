@@ -13,6 +13,7 @@
 该模块是策略实现的核心组件，为策略提供了完整的QMT交易和数据环境。
 """
 
+# 在文件顶部统一导入所有需要的模块
 from xtquant import xtdata
 from xtquant import xtconstant
 
@@ -30,6 +31,9 @@ pd.set_option('display.max_rows', None)  # 显示所有行
 pd.set_option('display.max_columns', None)  # 显示所有列
 pd.set_option('display.width', None)  # 自动调整列宽
 pd.set_option('display.max_colwidth', None)  # 显示完整的列内容
+
+# 初始化xtdata配置
+xtdata.enable_hello = False  # 禁用QMT数据接口的hello消息
 
 
 class Context:
@@ -82,11 +86,104 @@ class Context:
         """
         self.tasks = []  # 定时任务列表
         self.xt_trader = xt_trader  # QMT交易接口
-        xtdata.enable_hello = False  # 禁用QMT数据接口的hello消息
         self.custom_data = custom_data  # 自定义数据接口
         self.qmt_account = account  # 交易账户
         self.strategy_name = strategy_name  # 策略名称
         self.is_simulate = mode == 1  # 是否为模拟盘
+        self.callbacks = {}  # 回调函数字典
+    
+    # 提供明确的xtdata接口方法
+    def subscribe_quote(self, stock_code, period, callback):
+        """
+        订阅股票行情数据
+        
+        参数:
+            stock_code (str): 股票代码，如 '000001.SZ'
+            period (str): 行情周期，支持 '1m'、'5m'、'15m'、'1d'、'tick' 等
+            callback (callable): 行情数据回调函数
+            
+        返回:
+            bool: 订阅是否成功
+        """
+        try:
+            xtdata.subscribe_quote(stock_code, period=period, callback=callback)
+            return True
+        except Exception as e:
+            logger.error(f"{RED}【订阅失败】{RESET} 股票:{stock_code} 周期:{period} 错误:{e}")
+            return False
+    
+    def unsubscribe_quote(self, stock_code):
+        """
+        取消订阅股票行情数据
+        
+        参数:
+            stock_code (str): 股票代码，如 '000001.SZ'
+            
+        返回:
+            bool: 取消订阅是否成功
+        """
+        try:
+            xtdata.unsubscribe_quote(stock_code)
+            return True
+        except Exception as e:
+            logger.error(f"{RED}【取消订阅失败】{RESET} 股票:{stock_code} 错误:{e}")
+            return False
+    
+    def get_market_data(self, field_list, stock_list, start_time, end_time, period='1d', dividend_type='none', fill_data=True):
+        """
+        获取市场历史数据
+        
+        对xtdata.get_market_data的封装，提供统一的接口
+        
+        参数:
+            field_list (list): 字段列表，如 ['close', 'open', 'high', 'low', 'volume']
+            stock_list (list): 股票代码列表，如 ['000001.SZ', '600000.SH']
+            start_time (str): 开始时间，格式为 'YYYYMMDD'
+            end_time (str): 结束时间，格式为 'YYYYMMDD'
+            period (str): 行情周期，支持 '1m'、'5m'、'15m'、'1d' 等
+            dividend_type (str): 除权类型，'none'、'front'、'back'、'inner'
+            fill_data (bool): 是否填充数据
+            
+        返回:
+            pd.DataFrame: 市场数据
+        """
+        return xtdata.get_market_data(field_list, stock_list, start_time, end_time, period, dividend_type, fill_data)
+    
+    def download_history_data(self, stock_list, period='1d', start_time='20220101'):
+        """
+        下载历史数据
+        
+        对xtdata.download_history_data的封装，提供统一的接口
+        
+        参数:
+            stock_list (list): 股票代码列表，如 ['000001.SZ', '600000.SH']
+            period (str): 行情周期，支持 '1m'、'5m'、'15m'、'1d' 等
+            start_time (str): 开始时间，格式为 'YYYYMMDD'
+            
+        返回:
+            bool: 下载是否成功
+        """
+        try:
+            xtdata.download_history_data(stock_list, period, start_time)
+            return True
+        except Exception as e:
+            logger.error(f"{RED}【下载历史数据失败】{RESET} 错误:{e}")
+            return False
+
+    def register_callback(self, event_type, callback_func):
+        """
+        注册回调函数（已弃用）
+        
+        注意：此方法保留仅为兼容性目的，实际项目中推荐使用xtdata.subscribe_quote的回调机制
+        
+        参数:
+            event_type (str): 事件类型，如 'bar'、'tick' 等
+            callback_func (callable): 回调函数
+            
+        返回:
+            None
+        """
+        logger.warning(f"{YELLOW}【注册回调】{RESET} 此回调注册方法已弃用，请使用xtdata.subscribe_quote的回调机制")
 
     def run_time(self, func, period):
         """

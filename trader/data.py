@@ -35,16 +35,16 @@ class CustomData:
         
         在初始化时下载板块数据，确保在使用相关功能前数据已经准备好。
         """
-        try:
-            logger.info(f"{GREEN}【初始化数据】{RESET} 开始下载板块分类信息")
-            # 下载板块分类信息
-            self.download_sector_data()
-            logger.info(f"{GREEN}【初始化数据】{RESET} 板块分类信息下载完成")
-        except Exception as e:
-            logger.error(f"{YELLOW}【初始化数据失败】{RESET} {e}")
-            logger.info(f"{YELLOW}【初始化数据】{RESET} 将在使用时尝试重新下载板块数据")
+        # try:
+        #     logger.info(f"{GREEN}【初始化数据】{RESET} 开始下载板块分类信息")
+        #     # 下载板块分类信息
+        #     self.download_sector_data()
+        #     logger.info(f"{GREEN}【初始化数据】{RESET} 板块分类信息下载完成")
+        # except Exception as e:
+        #     logger.error(f"{YELLOW}【初始化数据失败】{RESET} {e}")
+        #     logger.info(f"{YELLOW}【初始化数据】{RESET} 将在使用时尝试重新下载板块数据")
 
-    def download_qmt_history_data(self, stock_list=None, period='1d'):
+    def download_qmt_history_data(self, stock_list=None, start_time='20250101', period='1d'):
         """
         使用QMT下载指定股票代码的历史数据
 
@@ -69,7 +69,7 @@ class CustomData:
         logger.debug(f"{GREEN}【数据下载】{RESET} {len(stock_list)}只")
         # 使用tqdm创建进度条，显示下载进度
         for code in tqdm(stock_list, desc=f"{GREEN}下载历史数据{RESET}", ncols=100, colour="green"):
-            xtdata.download_history_data(code, period=period, incrementally=True)
+            xtdata.download_history_data(code, period=period, start_time=start_time, incrementally=True)
 
 
     def get_qmt_daily_data(self, stock_list=['000001.SZ'], period='1d', start_time='', end_time='', count=100, is_download=True):
@@ -181,7 +181,15 @@ class CustomData:
             stock_code (str): 股票代码
             
         返回:
-            dict: 股票基本信息，包含股票名称、停牌状态、总市值等
+            dict: 股票基本信息，包含以下字段：
+                - 股票名称: 股票名称
+                - 停牌状态: 1表示停牌，0表示正常交易
+                - 总市值: 总市值（元）
+                - 涨停价: 当日涨停价
+                - 跌停价: 当日跌停价
+                - 前收盘价: 前一交易日收盘价
+                - 流通股本: 流通股本
+                - 是否可交易: 是否可交易
         """
         try:
             # 添加市场后缀
@@ -192,11 +200,20 @@ class CustomData:
             if detail is None:
                 return None
                 
+            # 获取停牌状态 (InstrumentStatus<=0:正常交易（-1:复牌）;>=1停牌天数)
+            instrument_status = detail.get('InstrumentStatus', 0)
+            is_suspended = 1 if instrument_status >= 1 else 0  # 1表示停牌，0表示正常交易
+                
             # 构建返回结果
             result = {
                 '股票名称': detail.get('InstrumentName', ''),
-                '停牌状态': 0 if detail.get('IsTrading', True) else 1,
-                '总市值': detail.get('TotalVolume', 0) * detail.get('PreClose', 0)
+                '停牌状态': is_suspended,
+                '总市值': detail.get('TotalVolume', 0) * detail.get('PreClose', 0),
+                '涨停价': detail.get('UpStopPrice', 0),
+                '跌停价': detail.get('DownStopPrice', 0),
+                '前收盘价': detail.get('PreClose', 0),
+                '流通股本': detail.get('FloatVolume', 0),
+                '是否可交易': detail.get('IsTrading', True)
             }
             
             return result

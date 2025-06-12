@@ -1,654 +1,698 @@
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
 一进二低吸战法策略模块
 
-该模块实现了一进二低吸战法量化交易策略的核心功能，包括：
-1. 股票选择条件 - 筛选符合条件的交易标的
-2. MACDFS指标计算 - 基于分时数据计算特殊的MACD指标
-3. 买入条件判断 - 根据MACDFS绿柱上缩等条件判断买入时机
-4. 卖出条件判断 - 根据MACDFS红柱下缩等条件判断卖出时机
-
-该策略主要针对涨停后的低吸机会，通过MACD指标的变化来捕捉买入和卖出时机。
+实现一进二低吸战法的核心交易逻辑，包括：
+1. 策略初始化
+2. 股票池管理
+3. 行情订阅
+4. 买入信号判断
+5. 卖出信号判断
+6. 交易执行
+7. 仓位风控管理
 """
 
-import os
-import configparser
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, time
+import traceback
+
 from trader.logger import logger
 from trader.anis import RED, GREEN, YELLOW, BLUE, RESET
-from trader.utils import add_stock_suffix, remove_stock_suffix
+from trader.utils import is_trade_time, add_stock_suffix
+from xtquant import xtdata
 
-# 读取配置文件
-config = configparser.ConfigParser()
-config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.ini')
-config.read(config_path, encoding='utf-8')
-
-# 策略参数
-MAIN_BOARD = config.getint('selection', 'main_board')
-EXCLUDE_ST = config.getint('selection', 'exclude_st')
-MAX_MARKET_CAP = config.getfloat('selection', 'max_market_cap')
-RECENT_DAYS = config.getint('selection', 'recent_days')
-NEW_HIGH_DAYS = config.getint('selection', 'new_high_days')
-
-BUY_AMOUNT = config.getfloat('trading', 'buy_amount')
-MAX_BUY_TIMES = config.getint('trading', 'max_buy_times')
-MAX_INTRADAY_GAIN = config.getfloat('trading', 'max_intraday_gain')
-
-SHORT_PERIOD = config.getint('indicator', 'short_period')
-LONG_PERIOD = config.getint('indicator', 'long_period')
-SIGNAL_PERIOD = config.getint('indicator', 'signal_period')
+from strategys.一进二低吸战法.config import (
+    BUY_AMOUNT, MAX_BUY_TIMES, MAX_INTRADAY_GAIN,
+    MACDFS_SHORT, MACDFS_LONG, MACDFS_SIGNAL,
+    STRATEGY_NAME, MAX_POSITION_RATIO, ENABLE_POSITION_CONTROL
+)
+from strategys.一进二低吸战法.indicator import (
+    calculate_macdfs, is_green_bar_shrinking, is_red_bar_shrinking
+)
+from strategys.一进二低吸战法.stock_pool import filter_stock_pool
 
 
-class StockSelector:
+class YiJinErDiXiStrategy:
     """
-    股票选择器类
+    一进二低吸战法策略类
     
-    根据策略条件筛选符合要求的股票，主要筛选条件包括：
-    1. 昨天涨停的股票（排除一字板）
-    2. 近期首次涨停
-    3. 价格创新高
-    4. 基本面限制（主板、非ST、市值上限）
+    实现一进二低吸战法的核心交易逻辑
     """
     
-    def __init__(self, context):
+    def __init__(self, context, data_download_success=False):
         """
-        初始化股票选择器
+        初始化策略
         
-        参数:
-            context: 交易上下文对象
+        Args:
+            context: QMT交易上下文对象
+            data_download_success: 是否已成功下载A股历史数据
         """
         self.context = context
-        self.selected_stocks = []
-    
-    def select_stocks(self):
-        """
-        选择符合条件的股票
+        # 不再直接导入xtdata模块，使用context提供的方法
         
-        返回:
-            list: 符合条件的股票代码列表
-        """
-        # 获取A股股票列表
-        stock_list = self.get_a_stocks()
-        
-        # 筛选符合条件的股票
-        selected_stocks = []
-        for stock in stock_list:
-            if self.check_stock_condition(stock):
-                selected_stocks.append(stock)
-        
-        self.selected_stocks = selected_stocks
-        logger.info(f"{GREEN}【选股结果】{RESET} 符合条件的股票数量: {len(selected_stocks)}")
-        return selected_stocks
-    
-    def get_a_stocks(self):
-        """
-        获取A股股票列表
-        
-        返回:
-            list: A股股票代码列表
-        """
-        # 使用QMT接口获取A股股票列表
-        stock_list = self.context.get_stock_list_in_sector('沪深A股')
-        return stock_list
-    
-    def check_stock_condition(self, stock):
-        """
-        检查股票是否符合选股条件
-        
-        参数:
-            stock (str): 股票代码
-            
-        返回:
-            bool: 是否符合条件
-        """
-        try:
-            # 获取股票基本信息
-            stock_info = self.context.get_stock_info(stock)
-            if stock_info is None:
-                return False
-            
-            # 检查是否为主板股票
-            if MAIN_BOARD and not (stock.startswith('00') or stock.startswith('60')):
-                return False
-            
-            # 检查是否为ST股票
-            if EXCLUDE_ST and ('ST' in stock_info['股票名称'] or '*' in stock_info['股票名称']):
-                return False
-            
-            # 检查是否停牌
-            if stock_info['停牌状态'] == 1:
-                return False
-            
-            # 检查市值上限
-            if stock_info['总市值'] > MAX_MARKET_CAP * 100000000:  # 转换为亿元
-                return False
-            
-            # 获取历史数据
-            df = self.context.custom_data.get_qmt_daily_data(
-                stock_list=[stock], 
-                period='1d', 
-                count=NEW_HIGH_DAYS + 1,
-                is_download = True
-            )
-            
-            if df.empty:
-                return False
-            
-            # 检查昨天是否涨停
-            yesterday_data = df.iloc[1]  # 索引0是今天的数据，索引1是昨天的数据
-            if not self.is_limit_up(yesterday_data):
-                return False
-            
-            # 检查是否为一字板
-            if yesterday_data['open'] == yesterday_data['close'] or yesterday_data['volume'] < yesterday_data['volume'].mean() * 0.3:
-                return False
-            
-            # 检查是否为近期首次涨停
-            recent_data = df.iloc[1:RECENT_DAYS+1]  # 最近N天的数据（不包括今天）
-            limit_up_days = [self.is_limit_up(day) for _, day in recent_data.iterrows()]
-            if sum(limit_up_days) > 1 or limit_up_days[0] == False:
-                return False
-            
-            # 检查昨天收盘价是否为近期新高
-            price_data = df.iloc[1:NEW_HIGH_DAYS+1]  # 最近N天的数据（不包括今天）
-            if yesterday_data['close'] < price_data['close'].max():
-                return False
-            
-            return True
-        
-        except Exception as e:
-            logger.error(f"{RED}【选股错误】{RESET} {stock}: {e}")
-            return False
-    
-    def is_limit_up(self, day_data):
-        """
-        判断是否涨停
-        
-        参数:
-            day_data (Series): 日线数据
-            
-        返回:
-            bool: 是否涨停
-        """
-        # 涨停幅度通常为10%，科创板、创业板为20%
-        limit_pct = 0.1
-        if day_data.name.startswith('68') or day_data.name.startswith('30'):
-            limit_pct = 0.2
-        
-        # 计算涨幅
-        prev_close = day_data['pre_close']
-        current_close = day_data['close']
-        pct_change = (current_close - prev_close) / prev_close
-        
-        # 判断是否涨停（允许有0.2%的误差）
-        return pct_change >= limit_pct - 0.002
-
-
-class MAFSIndicator:
-    """
-    MACDFS指标计算类
-    
-    计算基于分时数据的MACD指标（MACDFS），特点是：
-    1. 从当日开盘后第一分钟就开始计算
-    2. 开盘第一分钟的EMA初始值设为开盘价
-    3. 每个交易日的计算相对独立
-    """
-    
-    def __init__(self, short_period=SHORT_PERIOD, long_period=LONG_PERIOD, signal_period=SIGNAL_PERIOD):
-        """
-        初始化MACDFS指标计算器
-        
-        参数:
-            short_period (int): 短期EMA周期，默认为12
-            long_period (int): 长期EMA周期，默认为26
-            signal_period (int): 信号线EMA周期，默认为9
-        """
-        self.short_period = short_period
-        self.long_period = long_period
-        self.signal_period = signal_period
-        
-        # 当日数据缓存
-        self.today_data = {}
-    
-    def calculate(self, stock, minute_data):
-        """
-        计算MACDFS指标
-        
-        参数:
-            stock (str): 股票代码
-            minute_data (DataFrame): 分钟级别的行情数据
-            
-        返回:
-            DataFrame: 包含MACDFS指标的DataFrame
-        """
-        if minute_data.empty:
-            return pd.DataFrame()
-        
-        # 确保数据按时间排序
-        df = minute_data.sort_index()
-        
-        # 获取当前交易日
-        current_date = df.index[0].strftime('%Y-%m-%d')
-        
-        # 如果是新的交易日，重置缓存
-        if stock not in self.today_data or self.today_data[stock]['date'] != current_date:
-            # 初始化EMA值为开盘价
-            open_price = df.iloc[0]['open']
-            self.today_data[stock] = {
-                'date': current_date,
-                'short_ema': open_price,
-                'long_ema': open_price,
-                'dif': 0,
-                'dea': 0,
-                'macd': 0,
-                'history': []
-            }
-        
-        # 计算MACDFS指标
-        result = []
-        for idx, row in df.iterrows():
-            price = row['close']
-            
-            # 计算EMA
-            short_ema = self._calculate_ema(price, self.today_data[stock]['short_ema'], self.short_period)
-            long_ema = self._calculate_ema(price, self.today_data[stock]['long_ema'], self.long_period)
-            
-            # 计算DIF
-            dif = short_ema - long_ema
-            
-            # 计算DEA
-            dea = self._calculate_ema(dif, self.today_data[stock]['dea'], self.signal_period)
-            
-            # 计算MACD
-            macd = 2 * (dif - dea)
-            
-            # 更新缓存
-            self.today_data[stock]['short_ema'] = short_ema
-            self.today_data[stock]['long_ema'] = long_ema
-            self.today_data[stock]['dif'] = dif
-            self.today_data[stock]['dea'] = dea
-            self.today_data[stock]['macd'] = macd
-            
-            # 添加到结果
-            result.append({
-                'time': idx,
-                'price': price,
-                'short_ema': short_ema,
-                'long_ema': long_ema,
-                'dif': dif,
-                'dea': dea,
-                'macd': macd
-            })
-            
-            # 添加到历史记录
-            self.today_data[stock]['history'].append({
-                'time': idx,
-                'price': price,
-                'macd': macd
-            })
-        
-        return pd.DataFrame(result)
-    
-    def _calculate_ema(self, current, previous, period):
-        """
-        计算EMA值
-        
-        参数:
-            current (float): 当前价格
-            previous (float): 前一个EMA值
-            period (int): EMA周期
-            
-        返回:
-            float: 计算得到的EMA值
-        """
-        alpha = 2 / (period + 1)
-        return current * alpha + previous * (1 - alpha)
-    
-    def is_green_bar_shrinking(self, stock, count=2):
-        """
-        判断MACDFS绿柱是否连续上缩
-        
-        参数:
-            stock (str): 股票代码
-            count (int): 连续上缩的根数，默认为2
-            
-        返回:
-            bool: 是否连续上缩
-        """
-        if stock not in self.today_data or len(self.today_data[stock]['history']) < count + 1:
-            return False
-        
-        # 获取最近的MACD值
-        recent_macd = [item['macd'] for item in self.today_data[stock]['history'][-count-1:]]
-        
-        # 判断是否为绿柱
-        if recent_macd[-1] >= 0:
-            return False
-        
-        # 判断是否连续上缩（绿柱变短）
-        for i in range(1, count + 1):
-            if recent_macd[-i] <= recent_macd[-i-1]:
-                return False
-        
-        return True
-    
-    def is_red_bar_shrinking(self, stock, count=2):
-        """
-        判断MACDFS红柱是否连续下缩
-        
-        参数:
-            stock (str): 股票代码
-            count (int): 连续下缩的根数，默认为2
-            
-        返回:
-            bool: 是否连续下缩
-        """
-        if stock not in self.today_data or len(self.today_data[stock]['history']) < count + 1:
-            return False
-        
-        # 获取最近的MACD值
-        recent_macd = [item['macd'] for item in self.today_data[stock]['history'][-count-1:]]
-        
-        # 判断是否为红柱
-        if recent_macd[-1] <= 0:
-            return False
-        
-        # 判断是否连续下缩（红柱变短）
-        for i in range(1, count + 1):
-            if recent_macd[-i] >= recent_macd[-i-1]:
-                return False
-        
-        return True
-
-
-class TradingStrategy:
-    """
-    交易策略类
-    
-    实现一进二低吸战法的买入和卖出逻辑，包括：
-    1. 买入条件判断 - MACDFS绿柱上缩、价格高于分时均价等
-    2. 卖出条件判断 - MACDFS红柱下缩、次日开盘条件等
-    3. 交易记录管理 - 记录每只股票的买入次数和买入价格
-    """
-    
-    def __init__(self, context):
-        """
-        初始化交易策略
-        
-        参数:
-            context: 交易上下文对象
-        """
-        self.context = context
-        self.macd_indicator = MAFSIndicator()
-        self.stock_selector = StockSelector(context)
+        self.stock_pool = []  # 符合条件的股票池
+        self.subscribed_stocks = []  # 已订阅行情的股票
+        self.data_download_success = data_download_success  # 是否已成功下载A股历史数据
         
         # 交易记录
-        self.trade_records = {}
+        self.stock_buy_times = {}  # 记录每只股票的买入次数，格式：{stock_code: count}
+        self.stock_buy_prices = {}  # 记录每只股票当天的买入价格，格式：{stock_code: [price1, price2]}
+        self.stock_sell_times = {}  # 记录每只股票的卖出次数，格式：{stock_code: count}
         
-        # 初始化选股
-        self.selected_stocks = []
-    
-    def initialize(self):
-        """
-        初始化策略，选择符合条件的股票
-        """
-        self.selected_stocks = self.stock_selector.select_stocks()
-        logger.info(f"{GREEN}【策略初始化】{RESET} 选股完成，共选出 {len(self.selected_stocks)} 只股票")
-    
-    def process_minute_data(self, stock, minute_data):
-        """
-        处理分钟数据，计算指标并判断买卖条件
+        # MACDFS计算用的价格缓存，格式：{stock_code: {date: [price1, price2, ...]}}
+        self.price_cache = {}
+        # MACDFS计算结果缓存，格式：{stock_code: {date: [macdfs1, macdfs2, ...]}}
+        self.macdfs_cache = {}
         
-        参数:
-            stock (str): 股票代码
-            minute_data (DataFrame): 分钟级别的行情数据
+        # 分时均价缓存，格式：{stock_code: {date: avg_price}}
+        self.avg_price_cache = {}
+        
+        # 当日最高价缓存，格式：{stock_code: {date: high_price}}
+        self.high_price_cache = {}
+        
+        # 涨停价缓存，格式：{stock_code: {date: limit_up_price}}
+        self.limit_up_cache = {}
+        
+        # 是否为新的交易日
+        self.current_date = datetime.now().strftime('%Y-%m-%d')
+        
+        logger.info(f"{GREEN}【策略初始化】{RESET} 一进二低吸战法策略初始化完成")
+    
+    def update_stock_pool(self):
+        """
+        更新股票池
+        
+        根据选股条件重新筛选股票池
+        """
+        try:
+            # 筛选符合条件的股票
+            self.stock_pool = filter_stock_pool(self.context, self.data_download_success)
             
-        返回:
-            dict: 交易信号，包含买入或卖出信号
-        """
-        # 计算MACDFS指标
-        macd_data = self.macd_indicator.calculate(stock, minute_data)
-        if macd_data.empty:
-            return {'signal': 'none'}
-        
-        # 获取当前持仓
-        position = self.context.get_position(stock)
-        
-        # 如果有持仓，判断卖出条件
-        if position is not None and position['持仓数量'] > 0:
-            return self.check_sell_condition(stock, minute_data, macd_data)
-        
-        # 如果是选中的股票，判断买入条件
-        if stock in self.selected_stocks:
-            return self.check_buy_condition(stock, minute_data, macd_data)
-        
-        return {'signal': 'none'}
-    
-    def check_buy_condition(self, stock, minute_data, macd_data):
-        """
-        检查买入条件
-        
-        参数:
-            stock (str): 股票代码
-            minute_data (DataFrame): 分钟级别的行情数据
-            macd_data (DataFrame): MACDFS指标数据
+            # 清空交易记录
+            self.stock_buy_times = {}
+            self.stock_buy_prices = {}
+            self.stock_sell_times = {}
+            self.price_cache = {}
+            self.macdfs_cache = {}
+            self.avg_price_cache = {}
+            self.high_price_cache = {}
+            self.limit_up_cache = {}
             
-        返回:
-            dict: 买入信号
+            # 更新当前日期
+            self.current_date = datetime.now().strftime('%Y-%m-%d')
+            
+            # 订阅股票行情
+            self.subscribe_stock_quotes()
+            
+            logger.info(f"{GREEN}【股票池更新】{RESET} 共有 {len(self.stock_pool)} 只股票进入策略池")
+            
+        except Exception as e:
+            logger.error(f"{RED}【股票池更新失败】{RESET} {e}")
+            traceback.print_exc()
+    
+    def subscribe_stock_quotes(self):
         """
-        # 初始化交易记录
-        if stock not in self.trade_records:
-            self.trade_records[stock] = {
-                'buy_times': 0,
-                'buy_prices': []
-            }
+        订阅股票行情
         
-        # 检查买入次数是否达到上限
-        if self.trade_records[stock]['buy_times'] >= MAX_BUY_TIMES:
-            return {'signal': 'none'}
+        订阅股票池中所有股票和已持仓股票的分钟级行情
+        """
+        try:
+            # 取消之前的订阅
+            if self.subscribed_stocks:
+                # 遍历取消每个股票的订阅
+                for stock in self.subscribed_stocks:
+                    try:
+                        # 使用context提供的方法取消订阅
+                        self.context.unsubscribe_quote(stock)
+                    except Exception as e:
+                        logger.debug(f"{YELLOW}【取消订阅失败】{RESET} 股票:{stock} 错误:{e}")
+                
+                logger.debug(f"{BLUE}【取消订阅】{RESET} 已取消 {len(self.subscribed_stocks)} 只股票的行情订阅")
+                self.subscribed_stocks = []
+            
+            # 获取持仓信息，将已持仓的股票也加入到订阅列表中
+            position_stock_codes = []
+            positions = self.context.get_positions()
+            for position in positions:
+                stock_code = position['证券代码']
+                if stock_code not in self.stock_pool:
+                    position_stock_codes.append(stock_code)
+                    logger.debug(f"{GREEN}【持仓股票】{RESET} 股票:{stock_code} 持仓数量:{position['持仓数量']}")
+            
+            # 合并策略池和持仓股票
+            subscribe_stocks = list(set(self.stock_pool + position_stock_codes))
+            
+            # 订阅股票行情
+            if subscribe_stocks:
+                # 定义行情回调函数
+                def quote_callback(quote_data):
+                    try:
+                        if hasattr(quote_data, 'stock_code'):
+                            # 处理所有订阅的股票
+                            stock_code = quote_data.stock_code
+                            self.on_bar(quote_data)
+                    except Exception as e:
+                        logger.error(f"{RED}【行情处理错误】{RESET} 错误:{e}")
+                        traceback.print_exc()
+                
+                # 遍历订阅每个股票的行情
+                for stock in subscribe_stocks:
+                    try:
+                        # 使用context提供的方法订阅行情
+                        self.context.subscribe_quote(stock, period='1m', callback=quote_callback)
+                        logger.debug(f"{GREEN}【订阅成功】{RESET} 股票:{stock}")
+                        self.subscribed_stocks.append(stock)
+                    except Exception as e:
+                        logger.error(f"{RED}【订阅失败】{RESET} 股票:{stock} 错误:{e}")
+                
+                logger.info(f"{GREEN}【行情订阅】{RESET} 已订阅 {len(self.subscribed_stocks)} 只股票的行情，包含策略池股票 {len(self.stock_pool)} 只，持仓非策略池股票 {len(position_stock_codes)} 只")
+        except Exception as e:
+            logger.error(f"{RED}【行情订阅错误】{RESET} 错误:{e}")
+            traceback.print_exc()
+    
+    def on_bar(self, bar_data):
+        """
+        K线数据回调函数
         
-        # 检查股票是否在昨日已持仓
-        # 获取持仓情况
-        position = self.context.get_position(stock)
-        if position is not None and position['持仓数量'] > 0:
-            # 检查可用数量是否等于持仓数量
-            # 如果可用数量小于持仓数量，说明有部分股票是今日买入的（T+1交易规则导致不可卖出）
-            # 如果可用数量等于持仓数量，说明是昨日或更早买入的，不允许再次买入
-            if position['可用数量'] == position['持仓数量']:
-                logger.info(f"{YELLOW}【买入限制】{RESET} {stock} 为昨日或更早持仓，不允许买入")
-                return {'signal': 'none'}
+        当收到分钟K线数据时调用，用于策略信号判断和交易执行
         
-        # 检查MACDFS绿柱是否连续上缩
-        if not self.macd_indicator.is_green_bar_shrinking(stock):
-            return {'signal': 'none'}
+        Args:
+            bar_data: K线数据
+        """
+        try:
+            # 检查是否交易时间
+            if not is_trade_time():
+                return
+                
+            # 检查是否新的一天
+            current_date = datetime.now().strftime('%Y-%m-%d')
+            if current_date != self.current_date:
+                logger.info(f"{GREEN}【新交易日】{RESET} 清空交易记录和缓存")
+                # 清空交易记录
+                self.stock_buy_times = {}
+                self.stock_buy_prices = {}
+                self.stock_sell_times = {}
+                self.price_cache = {}
+                self.macdfs_cache = {}
+                self.avg_price_cache = {}
+                self.high_price_cache = {}
+                self.limit_up_cache = {}
+                self.current_date = current_date
+            
+            # 获取股票代码和时间
+            stock_code = bar_data.stock_code
+            bar_time = bar_data.time
+            
+            # 检查是否持有该股票
+            position = self.context.get_position(stock_code)
+            has_position = position and position['持仓数量'] > 0
+            
+            # 如果不在股票池中且没有持仓，则跳过处理
+            if stock_code not in self.stock_pool and not has_position:
+                return
+                
+            # 更新价格缓存
+            self.update_price_cache(stock_code, bar_data)
+            
+            # 计算MACDFS指标
+            self.calculate_stock_macdfs(stock_code)
+            
+            # 更新分时均价缓存
+            self.update_avg_price_cache(stock_code, bar_data)
+            
+            # 更新当日最高价缓存
+            self.update_high_price_cache(stock_code, bar_data)
+            
+            # 更新涨停价缓存
+            self.update_limit_up_cache(stock_code)
+            
+            # 判断是否为开盘第一分钟
+            is_first_minute = bar_time.hour == 9 and bar_time.minute == 30
+            
+            # 开盘第一分钟判断次日开盘卖出条件
+            if is_first_minute:
+                self.check_next_day_open_sell_signal(stock_code, bar_data)
+            
+            # 检查是否涨停开板
+            self.check_limit_up_break_sell_signal(stock_code, bar_data)
+            
+            # 检查卖出信号
+            self.check_sell_signal(stock_code)
+            
+            # 只有在股票池中的股票才检查买入信号
+            if stock_code in self.stock_pool:
+                self.check_buy_signal(stock_code, bar_data)
+            
+        except Exception as e:
+            logger.error(f"{RED}【行情处理异常】{RESET} 股票:{stock_code} 错误:{e}")
+            traceback.print_exc()
+    
+    def update_price_cache(self, stock_code, bar_data):
+        """
+        更新价格缓存
         
-        # 获取当前价格和最高价
-        current_price = minute_data.iloc[-1]['close']
-        high_price = minute_data['high'].max()
-        open_price = minute_data.iloc[0]['open']
+        将最新的分钟K线价格添加到缓存中
         
-        # 检查日内涨幅是否超过限制
-        if (high_price - open_price) / open_price > MAX_INTRADAY_GAIN / 100:
-            return {'signal': 'none'}
+        Args:
+            stock_code: 股票代码
+            bar_data: K线数据
+        """
+        current_date = datetime.now().strftime('%Y-%m-%d')
         
-        # 计算分时均价
-        amount = (minute_data['close'] * minute_data['volume']).sum()
-        volume = minute_data['volume'].sum()
-        avg_price = amount / volume if volume > 0 else 0
+        # 初始化价格缓存
+        if stock_code not in self.price_cache:
+            self.price_cache[stock_code] = {}
         
-        # 检查当前价格是否高于分时均价
+        if current_date not in self.price_cache[stock_code]:
+            self.price_cache[stock_code][current_date] = []
+        
+        # 添加价格到缓存
+        self.price_cache[stock_code][current_date].append(bar_data.close)
+    
+    def update_avg_price_cache(self, stock_code, bar_data):
+        """
+        更新分时均价缓存
+        
+        计算并缓存当前的分时均价
+        
+        Args:
+            stock_code: 股票代码
+            bar_data: K线数据
+        """
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        
+        # 初始化分时均价缓存
+        if stock_code not in self.avg_price_cache:
+            self.avg_price_cache[stock_code] = {}
+        
+        # 计算分时均价 = 当日累计成交金额 ÷ 当日累计成交股数
+        avg_price = bar_data.amount / bar_data.volume if bar_data.volume > 0 else 0
+        
+        # 缓存分时均价
+        self.avg_price_cache[stock_code][current_date] = avg_price
+    
+    def update_high_price_cache(self, stock_code, bar_data):
+        """
+        更新当日最高价缓存
+        
+        记录当日的最高价格
+        
+        Args:
+            stock_code: 股票代码
+            bar_data: K线数据
+        """
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        
+        # 初始化最高价缓存
+        if stock_code not in self.high_price_cache:
+            self.high_price_cache[stock_code] = {}
+        
+        # 获取当前缓存的最高价
+        current_high = self.high_price_cache[stock_code].get(current_date, 0)
+        
+        # 更新最高价
+        if bar_data.high > current_high:
+            self.high_price_cache[stock_code][current_date] = bar_data.high
+    
+    def update_limit_up_cache(self, stock_code):
+        """
+        更新涨停价缓存
+        
+        每只股票每天只获取一次涨停价信息并缓存
+        
+        Args:
+            stock_code: 股票代码
+        """
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        
+        # 初始化涨停价缓存
+        if stock_code not in self.limit_up_cache:
+            self.limit_up_cache[stock_code] = {}
+        
+        # 如果当日涨停价未缓存，则获取并缓存
+        if current_date not in self.limit_up_cache[stock_code]:
+            # 获取股票信息，包括涨停价
+            stock_info = self.context.get_stock_info(stock_code)
+            limit_up_price = stock_info['涨停价']
+            
+            # 缓存涨停价
+            self.limit_up_cache[stock_code][current_date] = limit_up_price
+            logger.debug(f"{BLUE}【涨停价缓存】{RESET} 股票:{stock_code} 涨停价:{limit_up_price:.2f}")
+    
+    def calculate_stock_macdfs(self, stock_code):
+        """
+        计算股票的MACDFS指标
+        
+        使用价格缓存计算MACDFS指标，确保每个交易日的MACDFS计算相对独立，
+        从零轴开始计算，与行情软件保持一致。
+        
+        Args:
+            stock_code: 股票代码
+        """
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        
+        # 初始化MACDFS缓存
+        if stock_code not in self.macdfs_cache:
+            self.macdfs_cache[stock_code] = {}
+        
+        if current_date not in self.macdfs_cache[stock_code]:
+            self.macdfs_cache[stock_code][current_date] = []
+        
+        # 获取价格数据
+        prices = self.price_cache[stock_code].get(current_date, [])
+        
+        if len(prices) >= 1:  # 至少需要1个价格点
+            # 使用第一个价格作为开盘价
+            open_price = prices[0]
+            
+            # 计算MACDFS，传递开盘价以便正确初始化
+            prices_series = pd.Series(prices)
+            macdfs_df = calculate_macdfs(
+                prices_series, 
+                fast_period=MACDFS_SHORT,
+                slow_period=MACDFS_LONG,
+                signal_period=MACDFS_SIGNAL,
+                open_price=open_price  # 传递开盘价
+            )
+            
+            # 缓存MACDFS值
+            self.macdfs_cache[stock_code][current_date] = macdfs_df['MACDFS'].tolist()
+    
+    def check_buy_signal(self, stock_code, bar_data):
+        """
+        检查买入信号
+        
+        检查是否满足买入条件：
+        1. 不在已持仓股票中
+        2. MACDFS绿柱连续两根上缩
+        3. 日内涨幅不超过9%
+        4. 当前价格大于分时均价
+        5. 价格保护机制
+        6. 仓位管理机制
+        
+        Args:
+            stock_code: 股票代码
+            bar_data: K线数据
+        """
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        
+        # 检查是否已持有该股票（包括前一交易日买入的）
+        position = self.context.get_position(stock_code)
+        if position and position['持仓数量'] > 0:
+            # 如果已持有该股票，不再考虑买入
+            return
+        
+        # 检查买入次数是否已达上限
+        buy_times = self.stock_buy_times.get(stock_code, 0)
+        if buy_times >= MAX_BUY_TIMES:
+            return
+        
+        # 获取MACDFS值
+        macdfs_values = self.macdfs_cache[stock_code].get(current_date, [])
+        
+        # 检查MACDFS绿柱是否连续两根上缩
+        if len(macdfs_values) < 3 or not is_green_bar_shrinking(macdfs_values):
+            return
+        
+        # 获取当日最高价
+        high_price = self.high_price_cache[stock_code].get(current_date, 0)
+        
+        # 检查当日涨幅是否超过限制
+        prev_close = bar_data.pre_close
+        intraday_gain = (high_price - prev_close) / prev_close if prev_close > 0 else 0
+        if intraday_gain > MAX_INTRADAY_GAIN:
+            logger.debug(f"{BLUE}【涨幅超限】{RESET} 股票:{stock_code} 日内最高涨幅:{intraday_gain:.2%} 超过{MAX_INTRADAY_GAIN:.2%}")
+            return
+        
+        # 获取分时均价
+        avg_price = self.avg_price_cache[stock_code].get(current_date, 0)
+        
+        # 检查当前价格是否大于分时均价
+        current_price = bar_data.close
         if current_price <= avg_price:
-            return {'signal': 'none'}
+            logger.debug(f"{BLUE}【价格低于均价】{RESET} 股票:{stock_code} 当前价格:{current_price:.2f} 分时均价:{avg_price:.2f}")
+            return
         
-        # 价格保护机制：如果已经有成交，新的买入价格不能低于上一次买入价格
-        if self.trade_records[stock]['buy_times'] > 0 and current_price < self.trade_records[stock]['buy_prices'][-1]:
-            return {'signal': 'none'}
+        # 价格保护机制：当天已有成交的情况下，新买入价格不能低于上一次买入价格
+        if buy_times > 0:
+            last_buy_price = self.stock_buy_prices[stock_code][-1]
+            if current_price < last_buy_price:
+                logger.debug(f"{BLUE}【价格保护】{RESET} 股票:{stock_code} 当前价格:{current_price:.2f} 上次买入价格:{last_buy_price:.2f}")
+                return
         
-        # 更新交易记录
-        self.trade_records[stock]['buy_times'] += 1
-        self.trade_records[stock]['buy_prices'].append(current_price)
-        
-        # 返回买入信号
-        return {
-            'signal': 'buy',
-            'price': current_price,
-            'amount': BUY_AMOUNT
-        }
+        # 执行买入
+        self.execute_buy(stock_code, current_price)
     
-    def check_sell_condition(self, stock, minute_data, macd_data):
+    def check_sell_signal(self, stock_code):
         """
-        检查卖出条件
+        检查卖出信号
         
-        参数:
-            stock (str): 股票代码
-            minute_data (DataFrame): 分钟级别的行情数据
-            macd_data (DataFrame): MACDFS指标数据，可能为None
-            
-        返回:
-            dict: 卖出信号
+        检查是否满足MACDFS指标卖出条件：
+        当MACDFS红柱连续下缩2根时触发卖出
+        
+        Args:
+            stock_code: 股票代码
         """
-        # 获取当前持仓
-        position = self.context.get_position(stock)
-        if position is None or position['持仓数量'] <= 0:
-            return {'signal': 'none'}
-            
-        # 检查是否有可用数量
-        if position['可用数量'] <= 0:
-            logger.info(f"{YELLOW}【卖出限制】{RESET} {stock} 没有可用数量，不能卖出")
-            return {'signal': 'none'}
+        current_date = datetime.now().strftime('%Y-%m-%d')
         
-        # 检查是否为开盘第一分钟
-        now = datetime.now()
-        market_open = datetime(now.year, now.month, now.day, 9, 30)
-        if now.hour == 9 and now.minute == 30:
-            # 获取昨日收盘价
-            daily_data = self.context.custom_data.get_qmt_daily_data(
-                stock_list=[stock], 
-                period='1d', 
-                count=2
+        # 检查是否持有该股票
+        position = self.context.get_position(stock_code)
+        if not position or position['可用数量'] <= 0:
+            return
+            
+        # 获取MACDFS值
+        macdfs_values = self.macdfs_cache[stock_code].get(current_date, [])
+        
+        # 检查MACDFS红柱是否连续两根下缩
+        if len(macdfs_values) < 3 or not is_red_bar_shrinking(macdfs_values):
+            return
+            
+        # 获取最新价格
+        latest_price = self.context.get_latest_price(stock_code)
+        
+        # 从缓存获取涨停价，如果未缓存则先更新缓存
+        if stock_code not in self.limit_up_cache or current_date not in self.limit_up_cache[stock_code]:
+            self.update_limit_up_cache(stock_code)
+        limit_up_price = self.limit_up_cache[stock_code][current_date]
+        
+        # 判断是否涨停
+        is_limit_up = (latest_price >= limit_up_price)
+        
+        # 涨停时不卖出
+        if is_limit_up:
+            logger.debug(f"{BLUE}【涨停不卖】{RESET} 股票:{stock_code} 当前价格:{latest_price:.2f} 涨停价:{limit_up_price:.2f}")
+            return
+            
+        # 获取卖出次数
+        sell_times = self.stock_sell_times.get(stock_code, 0)
+        
+        # 执行卖出
+        if sell_times == 0:
+            # 第一次触发，卖出1/2仓位
+            self.execute_sell(stock_code, latest_price, 0.5)
+        else:
+            # 第二次及以后触发，卖出全部剩余仓位
+            self.execute_sell(stock_code, latest_price, 1.0)
+    
+    def check_next_day_open_sell_signal(self, stock_code, bar_data):
+        """
+        检查次日开盘卖出条件
+        
+        如果次日开盘价低于昨日收盘价且第1分钟K线收阴，则清仓
+        
+        Args:
+            stock_code: 股票代码
+            bar_data: K线数据
+        """
+        # 检查是否持有该股票
+        position = self.context.get_position(stock_code)
+        if not position or position['可用数量'] <= 0:
+            return
+            
+        # 获取昨日收盘价
+        prev_close = bar_data.pre_close
+        
+        # 获取开盘价和第一分钟收盘价
+        open_price = bar_data.open
+        close_price = bar_data.close
+        
+        # 检查条件：开盘价低于昨日收盘价且第一分钟K线收阴
+        if open_price < prev_close and close_price < open_price:
+            logger.info(f"{YELLOW}【次日开盘卖出】{RESET} 股票:{stock_code} 开盘价:{open_price:.2f} 昨收价:{prev_close:.2f} 一分钟收阴")
+            
+            # 执行清仓
+            self.execute_sell(stock_code, close_price, 1.0)
+    
+    def check_limit_up_break_sell_signal(self, stock_code, bar_data):
+        """
+        检查涨停开板卖出条件
+        
+        如果上一分钟为涨停，但当前已低于涨停价（即开板），则立即全仓卖出
+        无论是开盘就涨停后开板，还是盘中涨停后开板，都会触发卖出信号
+        
+        Args:
+            stock_code: 股票代码
+            bar_data: K线数据
+        """
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        
+        # 检查是否持有该股票
+        position = self.context.get_position(stock_code)
+        if not position or position['可用数量'] <= 0:
+            return
+            
+        # 获取价格缓存
+        prices = self.price_cache[stock_code].get(current_date, [])
+        if len(prices) < 2:
+            return
+            
+        # 获取前一分钟价格和当前价格
+        prev_price = prices[-2]
+        current_price = prices[-1]
+        
+        # 从缓存获取涨停价
+        limit_up_price = self.limit_up_cache[stock_code][current_date]
+        
+        # 判断前一分钟是否涨停
+        is_prev_limit_up = (prev_price >= limit_up_price)
+        
+        # 判断当前价格是否低于涨停价（开板）
+        is_break_limit_up = (current_price < limit_up_price)
+        
+        # 检查条件：前一分钟涨停且当前价格低于涨停价（即开板）
+        if is_prev_limit_up and is_break_limit_up:
+            logger.info(f"{YELLOW}【涨停开板卖出】{RESET} 股票:{stock_code} 前一分钟价格:{prev_price:.2f} 当前价格:{current_price:.2f} 涨停价:{limit_up_price:.2f}")
+            
+            # 执行清仓，使用限价委托
+            self.execute_sell(stock_code, current_price, 1.0, use_limit_price=True)
+    
+    def execute_buy(self, stock_code, price):
+        """
+        执行买入操作
+        
+        Args:
+            stock_code: 股票代码
+            price: 参考价格，实际使用市价委托
+        """
+        try:
+            # 检查可用资金
+            asset = self.context.get_asset()
+            available_cash = asset['可用金额']
+            total_asset = asset['总资产']
+            
+            if available_cash < BUY_AMOUNT:
+                logger.warning(f"{YELLOW}【资金不足】{RESET} 可用资金:{available_cash:.2f} 小于买入金额:{BUY_AMOUNT:.2f}")
+                return
+            
+            # 检查整体仓位是否已达到最大限制
+            if ENABLE_POSITION_CONTROL:
+                # 计算当前总持仓市值
+                positions = self.context.get_positions()
+                total_position_value = sum([p['最新市值'] for p in positions]) if positions else 0
+                
+                # 计算当前仓位比例
+                current_position_ratio = total_position_value / total_asset if total_asset > 0 else 0
+                
+                # 预估本次买入后的仓位比例
+                estimated_new_position_ratio = (total_position_value + BUY_AMOUNT) / total_asset if total_asset > 0 else 0
+                
+                # 如果预估仓位超过设定的最大仓位比例，则不执行买入
+                if estimated_new_position_ratio > MAX_POSITION_RATIO:
+                    logger.warning(f"{YELLOW}【仓位超限】{RESET} 股票:{stock_code} 当前仓位比例:{current_position_ratio:.2%} 本次买入后预估仓位比例:{estimated_new_position_ratio:.2%} 超过最大限制:{MAX_POSITION_RATIO:.2%}")
+                    return
+                
+                logger.debug(f"{BLUE}【仓位检查】{RESET} 股票:{stock_code} 当前仓位比例:{current_position_ratio:.2%} 买入后预估仓位比例:{estimated_new_position_ratio:.2%} 最大限制:{MAX_POSITION_RATIO:.2%}")
+                
+            # 获取股票名称
+            stock_name = self.context.get_security_name(stock_code)
+            
+            # 记录买入次数
+            if stock_code not in self.stock_buy_times:
+                self.stock_buy_times[stock_code] = 0
+                self.stock_buy_prices[stock_code] = []
+                
+            self.stock_buy_times[stock_code] += 1
+            self.stock_buy_prices[stock_code].append(price)
+            
+            # 记录买入备注
+            buy_times = self.stock_buy_times[stock_code]
+            remark = f"{STRATEGY_NAME}-买入{buy_times}"
+            
+            # 执行买入，使用市价委托（价格参数设为0）
+            self.context.order_value(
+                security=stock_code,
+                value=BUY_AMOUNT,
+                price=0,  # 使用0表示市价委托
+                strategy_name=STRATEGY_NAME,
+                remark=remark
             )
-            if not daily_data.empty:
-                yesterday_close = daily_data.iloc[1]['close']
-                today_open = minute_data.iloc[0]['open']
-                first_minute_close = minute_data.iloc[0]['close']
-                
-                # 次日开盘价低于昨日收盘价且第一分钟K线收阴
-                if today_open < yesterday_close and first_minute_close < today_open:
-                    return {
-                        'signal': 'sell',
-                        'price': 0,  # 市价单
-                        'percent': 1.0  # 清仓
-                    }
-        
-        # 如果macd_data为None，需要先计算
-        if macd_data is None:
-            macd_data = self.macd_indicator.calculate(stock, minute_data)
-            if macd_data.empty:
-                return {'signal': 'none'}
-        
-        # 检查MACDFS红柱是否连续下缩
-        if self.macd_indicator.is_red_bar_shrinking(stock):
-            # 初始化交易记录
-            if stock not in self.trade_records:
-                self.trade_records[stock] = {
-                    'sell_times': 0
-                }
-            elif 'sell_times' not in self.trade_records[stock]:
-                self.trade_records[stock]['sell_times'] = 0
             
-            # 第一次触发卖出一半仓位
-            if self.trade_records[stock]['sell_times'] == 0:
-                self.trade_records[stock]['sell_times'] += 1
-                
-                return {
-                    'signal': 'sell',
-                    'price': 0,  # 市价单
-                    'percent': 0.5  # 卖出一半
-                }
-            # 第二次触发卖出剩余仓位
-            elif self.trade_records[stock]['sell_times'] == 1:
-                self.trade_records[stock]['sell_times'] += 1
-                
-                return {
-                    'signal': 'sell',
-                    'price': 0,  # 市价单
-                    'percent': 1.0  # 清仓
-                }
-        
-        return {'signal': 'none'}
+            logger.info(f"{GREEN}【买入信号】{RESET} 股票:{stock_code} 名称:{stock_name} 参考价格:{price:.2f} 金额:{BUY_AMOUNT:.2f} 次数:{buy_times} 委托方式:市价")
+            
+        except Exception as e:
+            logger.error(f"{RED}【买入失败】{RESET} 股票:{stock_code} 错误:{e}")
+            traceback.print_exc()
     
-    def get_minute_data(self, stock):
+    def execute_sell(self, stock_code, price, ratio=1.0, use_limit_price=False):
         """
-        获取股票的分钟级别数据
+        执行卖出操作
         
-        参数:
-            stock (str): 股票代码
-            
-        返回:
-            DataFrame: 分钟级别的行情数据
+        Args:
+            stock_code: 股票代码
+            price: 参考价格，实际使用市价委托
+            ratio: 卖出比例，默认为1.0（全部卖出）
+            use_limit_price: 是否使用限价委托，默认为False表示使用市价委托
         """
-        # 获取当前日期
-        now = datetime.now()
-        today = now.strftime('%Y-%m-%d')
-        
-        # 获取分钟数据
-        minute_data = self.context.custom_data.get_qmt_daily_data(
-            stock_list=[stock], 
-            period='1m', 
-            start_time=f'{today} 09:30:00',
-            end_time=f'{today} {now.strftime("%H:%M:%S")}',
-            is_download=True
-        )
-        
-        return minute_data
-    
-    def execute_trade(self, stock, signal):
-        """
-        执行交易
-        
-        参数:
-            stock (str): 股票代码
-            signal (dict): 交易信号
-            
-        返回:
-            str: 订单ID或None
-        """
-        if signal['signal'] == 'buy':
-            # 执行买入
-            order_id = self.context.order_value(
-                security=stock,
-                value=signal['amount'],
-                price=signal['price'],
-                strategy_name='一进二低吸战法',
-                remark=f'MACDFS绿柱上缩买入'
-            )
-            if order_id:
-                logger.info(f"{GREEN}【买入信号】{RESET} {stock} 价格: {signal['price']} 金额: {signal['amount']}")
-            return order_id
-        
-        elif signal['signal'] == 'sell':
-            # 获取持仓
-            position = self.context.get_position(stock)
-            if position is None:
-                return None
-            
+        try:
+            # 检查持仓
+            position = self.context.get_position(stock_code)
+            if not position or position['可用数量'] <= 0:
+                return
+                
             # 计算卖出数量
-            sell_amount = int(position['持仓数量'] * signal['percent'])
-            if sell_amount <= 0:
-                return None
+            available_shares = position['可用数量']
+            sell_shares = int(available_shares * ratio)
+            
+            if sell_shares <= 0:
+                return
+                
+            # 获取股票名称
+            stock_name = self.context.get_security_name(stock_code)
+            
+            # 记录卖出次数
+            if stock_code not in self.stock_sell_times:
+                self.stock_sell_times[stock_code] = 0
+                
+            self.stock_sell_times[stock_code] += 1
+            
+            # 记录卖出备注
+            sell_times = self.stock_sell_times[stock_code]
+            remark = f"{STRATEGY_NAME}-卖出{sell_times}"
+            
+            # 根据参数决定是使用限价委托还是市价委托
+            if use_limit_price:
+                # 使用限价委托，设置为当前价格略低一点（降低0.2%），提高成交概率
+                # 炸板时通常股价会快速下跌，设置稍低的价格有助于成交
+                limit_price = price * 0.99  # 当前价格的99%
+                price_type = "限价"
+            else:
+                # 使用市价委托
+                limit_price = 0
+                price_type = "市价"
             
             # 执行卖出
-            order_id = self.context.order(
-                security=stock,
-                amount=-sell_amount,  # 负数表示卖出
-                price=signal['price'],
-                strategy_name='一进二低吸战法',
-                remark=f'MACDFS红柱下缩卖出'
+            self.context.order(
+                security=stock_code,
+                amount=-sell_shares,
+                price=limit_price,
+                strategy_name=STRATEGY_NAME,
+                remark=remark
             )
-            if order_id:
-                logger.info(f"{RED}【卖出信号】{RESET} {stock} 价格: {signal['price']} 数量: {sell_amount}")
-            return order_id
-        
-        return None
+            
+            logger.info(f"{YELLOW}【卖出信号】{RESET} 股票:{stock_code} 名称:{stock_name} 参考价格:{price:.2f} 委托价格:{limit_price if limit_price > 0 else '市价':.2f} 数量:{sell_shares} 比例:{ratio:.2%} 次数:{sell_times} 委托方式:{price_type}")
+            
+        except Exception as e:
+            logger.error(f"{RED}【卖出失败】{RESET} 股票:{stock_code} 错误:{e}")
+            traceback.print_exc() 
