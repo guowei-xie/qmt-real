@@ -17,6 +17,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, time
 import traceback
+from collections import namedtuple
 
 from trader.logger import logger
 from trader.anis import RED, GREEN, YELLOW, BLUE, RESET
@@ -32,6 +33,9 @@ from strategys.一进二低吸战法.indicator import (
     calculate_macdfs, is_green_bar_shrinking, is_red_bar_shrinking
 )
 from strategys.一进二低吸战法.stock_pool import filter_stock_pool
+
+# 定义BarData数据结构
+BarData = namedtuple('BarData', ['stock_code', 'time', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pre_close'])
 
 
 class YiJinErDiXiStrategy:
@@ -55,6 +59,7 @@ class YiJinErDiXiStrategy:
         self.stock_pool = []  # 符合条件的股票池
         self.subscribed_stocks = []  # 已订阅行情的股票
         self.data_download_success = data_download_success  # 是否已成功下载A股历史数据
+        self.last_minute = {}  # 记录每个股票最后处理的分钟时间
         
         # 交易记录
         self.stock_buy_times = {}  # 记录每只股票的买入次数，格式：{stock_code: count}
@@ -90,15 +95,8 @@ class YiJinErDiXiStrategy:
             # 筛选符合条件的股票
             self.stock_pool = filter_stock_pool(self.context, self.data_download_success)
             
-            # 清空交易记录
-            self.stock_buy_times = {}
-            self.stock_buy_prices = {}
-            self.stock_sell_times = {}
-            self.price_cache = {}
-            self.macdfs_cache = {}
-            self.avg_price_cache = {}
-            self.high_price_cache = {}
-            self.limit_up_cache = {}
+            # 清空交易记录和缓存
+            self._clear_cache()
             
             # 更新当前日期
             self.current_date = datetime.now().strftime('%Y-%m-%d')
@@ -111,6 +109,19 @@ class YiJinErDiXiStrategy:
         except Exception as e:
             logger.error(f"{RED}【股票池更新失败】{RESET} {e}")
             traceback.print_exc()
+    
+    def _clear_cache(self):
+        """
+        清空所有缓存和交易记录
+        """
+        self.stock_buy_times = {}
+        self.stock_buy_prices = {}
+        self.stock_sell_times = {}
+        self.price_cache = {}
+        self.macdfs_cache = {}
+        self.avg_price_cache = {}
+        self.high_price_cache = {}
+        self.limit_up_cache = {}
     
     def subscribe_stock_quotes(self):
         """
@@ -131,6 +142,7 @@ class YiJinErDiXiStrategy:
                 
                 logger.debug(f"{BLUE}【取消订阅】{RESET} 已取消 {len(self.subscribed_stocks)} 只股票的行情订阅")
                 self.subscribed_stocks = []
+                self.last_minute = {}  # 清空最后处理时间记录
             
             # 获取持仓信息，将已持仓的股票也加入到订阅列表中
             position_stock_codes = []
@@ -149,10 +161,45 @@ class YiJinErDiXiStrategy:
                 # 定义行情回调函数
                 def quote_callback(quote_data):
                     try:
-                        if hasattr(quote_data, 'stock_code'):
-                            # 处理所有订阅的股票
-                            stock_code = quote_data.stock_code
-                            self.on_bar(quote_data)
+                        if not quote_data:
+                            return
+                            
+                        # 获取股票代码和K线数据
+                        stock_code = list(quote_data.keys())[0]  # 单股订阅只有一个股票
+                        bar_list = quote_data[stock_code]
+                        
+                        if not bar_list:  # 跳过空数据
+                            return
+                            
+                        # 获取最新的K线数据
+                        bar_data = bar_list[-1]
+                        
+                        # 转换时间戳为datetime对象
+                        current_time = pd.to_datetime(bar_data['time'], unit='ms')
+                        
+                        # 获取当前分钟时间（去掉秒和微秒）
+                        current_minute = current_time.replace(second=0, microsecond=0)
+                        
+                        # 如果是新的分钟，且该股票之前没有处理过这个分钟的数据
+                        if stock_code not in self.last_minute or self.last_minute[stock_code] < current_minute:
+                            self.last_minute[stock_code] = current_minute
+                            
+                            # 创建BarData对象并调用on_bar
+                            bar_obj = BarData(
+                                stock_code=stock_code,
+                                time=current_time,
+                                open=bar_data['open'],
+                                high=bar_data['high'],
+                                low=bar_data['low'],
+                                close=bar_data['close'],
+                                volume=bar_data['volume'],
+                                amount=bar_data['amount'],
+                                pre_close=bar_data.get('preClose', 0)  # 添加pre_close字段，可能在某些情况下需要
+                            )
+                            
+                            # 调用on_bar处理K线数据
+                            self.on_bar(bar_obj)
+                        
                     except Exception as e:
                         logger.error(f"{RED}【行情处理错误】{RESET} 错误:{e}")
                         traceback.print_exc()
@@ -190,15 +237,8 @@ class YiJinErDiXiStrategy:
             current_date = datetime.now().strftime('%Y-%m-%d')
             if current_date != self.current_date:
                 logger.info(f"{GREEN}【新交易日】{RESET} 清空交易记录和缓存")
-                # 清空交易记录
-                self.stock_buy_times = {}
-                self.stock_buy_prices = {}
-                self.stock_sell_times = {}
-                self.price_cache = {}
-                self.macdfs_cache = {}
-                self.avg_price_cache = {}
-                self.high_price_cache = {}
-                self.limit_up_cache = {}
+                # 清空交易记录和缓存
+                self._clear_cache()
                 self.current_date = current_date
             
             # 获取股票代码和时间
@@ -229,20 +269,22 @@ class YiJinErDiXiStrategy:
             self.update_limit_up_cache(stock_code)
             
             # 判断是否为开盘第一分钟
-            is_first_minute = bar_time.hour == 9 and bar_time.minute == 30
+            is_first_minute = bar_time.hour == 9 and bar_time.minute == 31
             
-            # 开盘第一分钟判断次日开盘卖出条件
-            if is_first_minute:
-                self.check_next_day_open_sell_signal(stock_code, bar_data)
+            # 处理持仓股票的卖出信号
+            if has_position:
+                # 开盘第一分钟判断次日开盘卖出条件
+                if is_first_minute:
+                    self.check_next_day_open_sell_signal(stock_code, bar_data)
+                
+                # 检查是否涨停开板
+                self.check_limit_up_break_sell_signal(stock_code, bar_data)
+                
+                # 检查卖出信号
+                self.check_sell_signal(stock_code)
             
-            # 检查是否涨停开板
-            self.check_limit_up_break_sell_signal(stock_code, bar_data)
-            
-            # 检查卖出信号
-            self.check_sell_signal(stock_code)
-            
-            # 只有在股票池中的股票才检查买入信号
-            if stock_code in self.stock_pool:
+            # 处理股票池中的买入信号
+            if stock_code in self.stock_pool and not has_position:
                 self.check_buy_signal(stock_code, bar_data)
             
         except Exception as e:
@@ -262,11 +304,7 @@ class YiJinErDiXiStrategy:
         current_date = datetime.now().strftime('%Y-%m-%d')
         
         # 初始化价格缓存
-        if stock_code not in self.price_cache:
-            self.price_cache[stock_code] = {}
-        
-        if current_date not in self.price_cache[stock_code]:
-            self.price_cache[stock_code][current_date] = []
+        self._ensure_cache_initialized(self.price_cache, stock_code, current_date, default=[])
         
         # 添加价格到缓存
         self.price_cache[stock_code][current_date].append(bar_data.close)
@@ -284,8 +322,7 @@ class YiJinErDiXiStrategy:
         current_date = datetime.now().strftime('%Y-%m-%d')
         
         # 初始化分时均价缓存
-        if stock_code not in self.avg_price_cache:
-            self.avg_price_cache[stock_code] = {}
+        self._ensure_cache_initialized(self.avg_price_cache, stock_code)
         
         # 计算分时均价 = 当日累计成交金额 ÷ 当日累计成交股数
         avg_price = bar_data.amount / bar_data.volume if bar_data.volume > 0 else 0
@@ -306,8 +343,7 @@ class YiJinErDiXiStrategy:
         current_date = datetime.now().strftime('%Y-%m-%d')
         
         # 初始化最高价缓存
-        if stock_code not in self.high_price_cache:
-            self.high_price_cache[stock_code] = {}
+        self._ensure_cache_initialized(self.high_price_cache, stock_code)
         
         # 获取当前缓存的最高价
         current_high = self.high_price_cache[stock_code].get(current_date, 0)
@@ -328,8 +364,7 @@ class YiJinErDiXiStrategy:
         current_date = datetime.now().strftime('%Y-%m-%d')
         
         # 初始化涨停价缓存
-        if stock_code not in self.limit_up_cache:
-            self.limit_up_cache[stock_code] = {}
+        self._ensure_cache_initialized(self.limit_up_cache, stock_code)
         
         # 如果当日涨停价未缓存，则获取并缓存
         if current_date not in self.limit_up_cache[stock_code]:
@@ -354,11 +389,7 @@ class YiJinErDiXiStrategy:
         current_date = datetime.now().strftime('%Y-%m-%d')
         
         # 初始化MACDFS缓存
-        if stock_code not in self.macdfs_cache:
-            self.macdfs_cache[stock_code] = {}
-        
-        if current_date not in self.macdfs_cache[stock_code]:
-            self.macdfs_cache[stock_code][current_date] = []
+        self._ensure_cache_initialized(self.macdfs_cache, stock_code, current_date, default=[])
         
         # 获取价格数据
         prices = self.price_cache[stock_code].get(current_date, [])
@@ -385,12 +416,11 @@ class YiJinErDiXiStrategy:
         检查买入信号
         
         检查是否满足买入条件：
-        1. 不在已持仓股票中
-        2. MACDFS绿柱连续两根上缩
-        3. 日内涨幅不超过9%
-        4. 当前价格大于分时均价
-        5. 价格保护机制
-        6. 仓位管理机制
+        1. MACDFS绿柱连续两根上缩
+        2. 日内涨幅不超过9%
+        3. 当前价格大于分时均价
+        4. 价格保护机制
+        5. 仓位管理机制
         
         Args:
             stock_code: 股票代码
@@ -398,15 +428,10 @@ class YiJinErDiXiStrategy:
         """
         current_date = datetime.now().strftime('%Y-%m-%d')
         
-        # 检查是否已持有该股票（包括前一交易日买入的）
-        position = self.context.get_position(stock_code)
-        if position and position['持仓数量'] > 0:
-            # 如果已持有该股票，不再考虑买入
-            return
-        
         # 检查买入次数是否已达上限
         buy_times = self.stock_buy_times.get(stock_code, 0)
         if buy_times >= MAX_BUY_TIMES:
+            logger.debug(f"{BLUE}【买入次数已满】{RESET} 股票:{stock_code} 当前买入次数:{buy_times} 最大买入次数:{MAX_BUY_TIMES}")
             return
         
         # 获取MACDFS值
@@ -415,6 +440,8 @@ class YiJinErDiXiStrategy:
         # 检查MACDFS绿柱是否连续两根上缩
         if len(macdfs_values) < 3 or not is_green_bar_shrinking(macdfs_values):
             return
+            
+        logger.debug(f"{BLUE}【MACDFS绿柱上缩】{RESET} 股票:{stock_code} MACDFS值:{macdfs_values[-3:]}")
         
         # 获取当日最高价
         high_price = self.high_price_cache[stock_code].get(current_date, 0)
@@ -434,6 +461,8 @@ class YiJinErDiXiStrategy:
         if current_price <= avg_price:
             logger.debug(f"{BLUE}【价格低于均价】{RESET} 股票:{stock_code} 当前价格:{current_price:.2f} 分时均价:{avg_price:.2f}")
             return
+            
+        logger.debug(f"{BLUE}【价格高于均价】{RESET} 股票:{stock_code} 当前价格:{current_price:.2f} 分时均价:{avg_price:.2f}")
         
         # 价格保护机制：当天已有成交的情况下，新买入价格不能低于上一次买入价格
         if buy_times > 0:
@@ -441,6 +470,8 @@ class YiJinErDiXiStrategy:
             if current_price < last_buy_price:
                 logger.debug(f"{BLUE}【价格保护】{RESET} 股票:{stock_code} 当前价格:{current_price:.2f} 上次买入价格:{last_buy_price:.2f}")
                 return
+            
+            logger.debug(f"{BLUE}【价格保护通过】{RESET} 股票:{stock_code} 当前价格:{current_price:.2f} 上次买入价格:{last_buy_price:.2f}")
         
         # 执行买入
         self.execute_buy(stock_code, current_price)
@@ -457,11 +488,6 @@ class YiJinErDiXiStrategy:
         """
         current_date = datetime.now().strftime('%Y-%m-%d')
         
-        # 检查是否持有该股票
-        position = self.context.get_position(stock_code)
-        if not position or position['可用数量'] <= 0:
-            return
-            
         # 获取MACDFS值
         macdfs_values = self.macdfs_cache[stock_code].get(current_date, [])
         
@@ -472,9 +498,8 @@ class YiJinErDiXiStrategy:
         # 获取最新价格
         latest_price = self.context.get_latest_price(stock_code)
         
-        # 从缓存获取涨停价，如果未缓存则先更新缓存
-        if stock_code not in self.limit_up_cache or current_date not in self.limit_up_cache[stock_code]:
-            self.update_limit_up_cache(stock_code)
+        # 确保涨停价已缓存
+        self.update_limit_up_cache(stock_code)
         limit_up_price = self.limit_up_cache[stock_code][current_date]
         
         # 判断是否涨停
@@ -506,11 +531,6 @@ class YiJinErDiXiStrategy:
             stock_code: 股票代码
             bar_data: K线数据
         """
-        # 检查是否持有该股票
-        position = self.context.get_position(stock_code)
-        if not position or position['可用数量'] <= 0:
-            return
-            
         # 获取昨日收盘价
         prev_close = bar_data.pre_close
         
@@ -538,11 +558,6 @@ class YiJinErDiXiStrategy:
         """
         current_date = datetime.now().strftime('%Y-%m-%d')
         
-        # 检查是否持有该股票
-        position = self.context.get_position(stock_code)
-        if not position or position['可用数量'] <= 0:
-            return
-            
         # 获取价格缓存
         prices = self.price_cache[stock_code].get(current_date, [])
         if len(prices) < 2:
@@ -584,7 +599,7 @@ class YiJinErDiXiStrategy:
             
             if available_cash < BUY_AMOUNT:
                 logger.warning(f"{YELLOW}【资金不足】{RESET} 可用资金:{available_cash:.2f} 小于买入金额:{BUY_AMOUNT:.2f}")
-                return
+                return False
             
             # 检查整体仓位是否已达到最大限制
             if ENABLE_POSITION_CONTROL:
@@ -601,7 +616,7 @@ class YiJinErDiXiStrategy:
                 # 如果预估仓位超过设定的最大仓位比例，则不执行买入
                 if estimated_new_position_ratio > MAX_POSITION_RATIO:
                     logger.warning(f"{YELLOW}【仓位超限】{RESET} 股票:{stock_code} 当前仓位比例:{current_position_ratio:.2%} 本次买入后预估仓位比例:{estimated_new_position_ratio:.2%} 超过最大限制:{MAX_POSITION_RATIO:.2%}")
-                    return
+                    return False
                 
                 logger.debug(f"{BLUE}【仓位检查】{RESET} 股票:{stock_code} 当前仓位比例:{current_position_ratio:.2%} 买入后预估仓位比例:{estimated_new_position_ratio:.2%} 最大限制:{MAX_POSITION_RATIO:.2%}")
                 
@@ -621,7 +636,7 @@ class YiJinErDiXiStrategy:
             remark = f"{STRATEGY_NAME}-买入{buy_times}"
             
             # 执行买入，使用市价委托（价格参数设为0）
-            self.context.order_value(
+            order_result = self.context.order_value(
                 security=stock_code,
                 value=BUY_AMOUNT,
                 price=0,  # 使用0表示市价委托
@@ -629,11 +644,17 @@ class YiJinErDiXiStrategy:
                 remark=remark
             )
             
-            logger.info(f"{GREEN}【买入信号】{RESET} 股票:{stock_code} 名称:{stock_name} 参考价格:{price:.2f} 金额:{BUY_AMOUNT:.2f} 次数:{buy_times} 委托方式:市价")
+            if order_result and order_result.get('订单编号'):
+                logger.info(f"{GREEN}【买入信号】{RESET} 股票:{stock_code} 名称:{stock_name} 参考价格:{price:.2f} 金额:{BUY_AMOUNT:.2f} 次数:{buy_times} 委托方式:市价 订单编号:{order_result.get('订单编号')}")
+                return True
+            else:
+                logger.warning(f"{YELLOW}【买入失败】{RESET} 股票:{stock_code} 名称:{stock_name} 参考价格:{price:.2f} 金额:{BUY_AMOUNT:.2f} 委托方式:市价 返回结果:{order_result}")
+                return False
             
         except Exception as e:
             logger.error(f"{RED}【买入失败】{RESET} 股票:{stock_code} 错误:{e}")
             traceback.print_exc()
+            return False
     
     def execute_sell(self, stock_code, price, ratio=1.0, use_limit_price=False):
         """
@@ -644,19 +665,24 @@ class YiJinErDiXiStrategy:
             price: 参考价格，实际使用市价委托
             ratio: 卖出比例，默认为1.0（全部卖出）
             use_limit_price: 是否使用限价委托，默认为False表示使用市价委托
+            
+        Returns:
+            bool: 卖出是否成功
         """
         try:
             # 检查持仓
             position = self.context.get_position(stock_code)
             if not position or position['可用数量'] <= 0:
-                return
+                logger.debug(f"{BLUE}【无可用持仓】{RESET} 股票:{stock_code}")
+                return False
                 
             # 计算卖出数量
             available_shares = position['可用数量']
             sell_shares = int(available_shares * ratio)
             
             if sell_shares <= 0:
-                return
+                logger.debug(f"{BLUE}【卖出数量为0】{RESET} 股票:{stock_code} 可用数量:{available_shares} 比例:{ratio:.2%}")
+                return False
                 
             # 获取股票名称
             stock_name = self.context.get_security_name(stock_code)
@@ -683,7 +709,7 @@ class YiJinErDiXiStrategy:
                 price_type = "市价"
             
             # 执行卖出
-            self.context.order(
+            order_result = self.context.order(
                 security=stock_code,
                 amount=-sell_shares,
                 price=limit_price,
@@ -691,8 +717,32 @@ class YiJinErDiXiStrategy:
                 remark=remark
             )
             
-            logger.info(f"{YELLOW}【卖出信号】{RESET} 股票:{stock_code} 名称:{stock_name} 参考价格:{price:.2f} 委托价格:{limit_price if limit_price > 0 else '市价':.2f} 数量:{sell_shares} 比例:{ratio:.2%} 次数:{sell_times} 委托方式:{price_type}")
+            if order_result and order_result.get('订单编号'):
+                logger.info(f"{YELLOW}【卖出信号】{RESET} 股票:{stock_code} 名称:{stock_name} 参考价格:{price:.2f} 委托价格:{limit_price if limit_price > 0 else '市价'} 数量:{sell_shares} 比例:{ratio:.2%} 次数:{sell_times} 委托方式:{price_type} 订单编号:{order_result.get('订单编号')}")
+                return True
+            else:
+                logger.warning(f"{YELLOW}【卖出失败】{RESET} 股票:{stock_code} 名称:{stock_name} 参考价格:{price:.2f} 委托价格:{limit_price if limit_price > 0 else '市价'} 数量:{sell_shares} 委托方式:{price_type} 返回结果:{order_result}")
+                return False
             
         except Exception as e:
             logger.error(f"{RED}【卖出失败】{RESET} 股票:{stock_code} 错误:{e}")
-            traceback.print_exc() 
+            traceback.print_exc()
+            return False
+    
+    def _ensure_cache_initialized(self, cache_dict, stock_code, date=None, default=None):
+        """
+        确保缓存已初始化
+        
+        Args:
+            cache_dict: 缓存字典
+            stock_code: 股票代码
+            date: 日期，默认为None
+            default: 默认值，默认为None
+        """
+        if stock_code not in cache_dict:
+            cache_dict[stock_code] = {}
+        
+        if date is not None and date not in cache_dict[stock_code]:
+            if default is None:
+                default = {}
+            cache_dict[stock_code][date] = default if not isinstance(default, list) else [] 
