@@ -295,40 +295,66 @@ class Context:
 
     def get_asset(self):
         """
-        查询并返回账户的资产信息。
+        查询并返回账户资产信息。
 
         返回:
-            dict: 包含账户资产信息的字典。
+            dict: 包含账户资产信息的字典。如果查询失败，则返回None。
         """
-        asset_info = self.xt_trader.query_stock_asset(self.qmt_account)
-        return {display_name: getattr(asset_info, qmt_field.lower())
-                for display_name, qmt_field in QMT_ASSET_FIELD_MAPPING.items()
-                }
+        try:
+            asset_info = self.xt_trader.query_stock_asset(self.qmt_account)
+            if asset_info is None:
+                logger.error(f"{RED}【资产查询失败】{RESET} 账户:{self.qmt_account} 返回为None")
+                return None
+                
+            # 将资产信息转换为字典
+            asset_dict = {}
+            try:
+                for display_name, qmt_field in QMT_ASSET_FIELD_MAPPING.items():
+                    try:
+                        asset_dict[display_name] = getattr(asset_info, qmt_field.lower())
+                    except AttributeError:
+                        # 如果某个字段不存在，设置为0
+                        asset_dict[display_name] = 0
+                        logger.warning(f"{YELLOW}【字段不存在】{RESET} 字段:{qmt_field.lower()} 设置为默认值0")
+                return asset_dict
+            except Exception as e:
+                logger.error(f"{RED}【资产数据处理失败】{RESET} 错误:{e}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"{RED}【资产查询异常】{RESET} 账户:{self.qmt_account} 错误:{e}")
+            return None
 
     def get_total_asset(self):
         """
         查询并返回账户的总资产。
 
         返回:
-            float: 账户的总资产。
+            float: 账户的总资产。如果查询失败，返回0。
         """
-        return self.get_asset()['总资产']
+        asset = self.get_asset()
+        if asset is None:
+            return 0
+        return asset['总资产']
 
     def get_total_market_value(self):
         """
         查询并返回账户的持仓市值。
 
         返回:
-            float: 账户的持仓市值。
+            float: 账户的持仓市值。如果查询失败，返回0。
         """
-        return self.get_asset()['持仓市值']
+        asset = self.get_asset()
+        if asset is None:
+            return 0
+        return asset['持仓市值']
 
     def get_total_percent(self):
         """
         查询并返回账户的持仓仓位。
 
         返回:
-            float: 账户的持仓仓位。
+            float: 账户的持仓仓位。如果查询失败，返回0。
         """
         total_asset = self.get_total_asset()
         total_market_value = self.get_total_market_value()
@@ -342,9 +368,12 @@ class Context:
         查询并返回账户的可用余额。
 
         返回:
-            float: 账户的可用余额。
+            float: 账户的可用余额。如果查询失败，返回0。
         """
-        return self.get_asset()['可用金额']
+        asset = self.get_asset()
+        if asset is None:
+            return 0
+        return asset['可用金额']
 
     def get_orders(self, cancelable_only=False):
         """

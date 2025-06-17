@@ -61,7 +61,7 @@ def download_astock_history_data(context):
         context.custom_data.download_qmt_history_data(
             stock_list=stock_codes_with_suffix,
             period='1d', 
-            start_time='20220101'
+            start_time='20250101'
         )
         logger.info(f"{GREEN}【数据准备】{RESET} A股历史数据下载完成")
         return True
@@ -104,25 +104,17 @@ if __name__ == "__main__":
         
         # 下载A股历史数据
         logger.info(f"{GREEN}【系统启动】{RESET} 正在下载A股历史数据...")
-        data_download_success = download_astock_history_data(context)
-        # data_download_success = True
+        # data_download_success = download_astock_history_data(context)
+        data_download_success = True
         
         # 创建并初始化策略对象
-        logger.info(f"{GREEN}【策略启动】{RESET} 初始化一进二低吸战法策略...")
+        logger.info(f"{GREEN}【策略启动】{RESET} 初始化策略对象...")
         strategy = YiJinErDiXiStrategy(context, data_download_success)
-        
-        # 设置定时任务
-        logger.info(f"{GREEN}【策略启动】{RESET} 设置股票池更新定时任务...")
-        context.run_daily(refresh_stock_pool_task, STOCK_POOL_REFRESH_TIME)
         
         # 启动时立即更新股票池
         logger.info(f"{GREEN}【策略启动】{RESET} 正在更新股票池...")
         strategy.update_stock_pool()
-        
-        # 策略运行主循环
-        logger.info(f"{GREEN}【策略启动】{RESET} 策略已启动，等待行情推送...")
-        while True:
-            time.sleep(1)
+        xt_trader.run_forever()
             
     except KeyboardInterrupt:
         logger.info(f"{YELLOW}【系统关闭】{RESET} 用户手动终止程序")

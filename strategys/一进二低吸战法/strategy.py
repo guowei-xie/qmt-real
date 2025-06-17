@@ -11,11 +11,12 @@
 5. 卖出信号判断
 6. 交易执行
 7. 仓位风控管理
+8. 订单管理与超时撤单
 """
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 import traceback
 from collections import namedtuple
 
@@ -36,6 +37,9 @@ from strategys.一进二低吸战法.stock_pool import filter_stock_pool
 
 # 定义BarData数据结构
 BarData = namedtuple('BarData', ['stock_code', 'time', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pre_close'])
+
+# 订单超时撤单配置
+ORDER_TIMEOUT_SECONDS = 180  # 订单超时时间(秒)
 
 
 class YiJinErDiXiStrategy:
@@ -83,6 +87,13 @@ class YiJinErDiXiStrategy:
         # 是否为新的交易日
         self.current_date = datetime.now().strftime('%Y-%m-%d')
         
+        # 订单管理
+        self.active_orders = {}  # 活跃订单，格式：{order_id: {'time': 下单时间, 'stock_code': 股票代码, 'order_type': '买入'/'卖出'}}
+        self.order_timeout = ORDER_TIMEOUT_SECONDS  # 订单超时时间(秒)
+        
+        # 设置定时任务
+        self.setup_tasks()
+        
         logger.info(f"{GREEN}【策略初始化】{RESET} 一进二低吸战法策略初始化完成")
     
     def update_stock_pool(self):
@@ -122,7 +133,65 @@ class YiJinErDiXiStrategy:
         self.avg_price_cache = {}
         self.high_price_cache = {}
         self.limit_up_cache = {}
+        self.active_orders = {}  # 清空活跃订单记录
     
+    def _normalize_bar_data(self, bar_data):
+        """
+        规范化K线数据，处理数据格式问题
+        
+        Args:
+            bar_data (dict): 原始K线数据
+            
+        Returns:
+            dict: 规范化后的K线数据
+        """
+        normalized = {}
+        
+        # 处理时间戳
+        if 'time' in bar_data:
+            normalized['time'] = bar_data['time']
+        
+        # 处理价格数据 - 修复浮点精度问题
+        for field in ['open', 'high', 'low', 'close']:
+            if field in bar_data:
+                # 处理科学计数法和浮点精度问题
+                try:
+                    value = float(bar_data[field])
+                    # 四舍五入到2位小数，避免浮点精度问题
+                    normalized[field] = round(value, 2)
+                except (ValueError, TypeError):
+                    normalized[field] = 0.0
+        
+        # 处理成交量和成交额
+        for field in ['volume', 'amount']:
+            if field in bar_data:
+                try:
+                    normalized[field] = int(float(bar_data[field]))
+                except (ValueError, TypeError):
+                    normalized[field] = 0
+        
+        # 处理前收盘价 - 处理可能的科学计数法格式
+        if 'preClose' in bar_data:
+            try:
+                preClose = float(bar_data['preClose'])
+                # 如果前收盘价异常小或为0，可能是数据错误
+                if preClose < 0.01 or preClose > 10000:
+                    # 尝试使用其他方式获取前收盘价
+                    preClose = 0.0
+                normalized['preClose'] = round(preClose, 2)
+            except (ValueError, TypeError):
+                normalized['preClose'] = 0.0
+        
+        # 处理其他字段
+        for field in ['settlementPrice', 'openInterest', 'dr', 'totaldr', 'suspendFlag']:
+            if field in bar_data:
+                try:
+                    normalized[field] = float(bar_data[field])
+                except (ValueError, TypeError):
+                    normalized[field] = 0.0
+        
+        return normalized
+
     def subscribe_stock_quotes(self):
         """
         订阅股票行情
@@ -146,12 +215,16 @@ class YiJinErDiXiStrategy:
             
             # 获取持仓信息，将已持仓的股票也加入到订阅列表中
             position_stock_codes = []
-            positions = self.context.get_positions()
-            for position in positions:
-                stock_code = position['证券代码']
-                if stock_code not in self.stock_pool:
-                    position_stock_codes.append(stock_code)
-                    logger.debug(f"{GREEN}【持仓股票】{RESET} 股票:{stock_code} 持仓数量:{position['持仓数量']}")
+            positions_df = self.context.get_positions()
+            
+            # 检查是否有持仓
+            if not positions_df.empty:
+                # 遍历DataFrame的每一行
+                for _, position in positions_df.iterrows():
+                    stock_code = position['证券代码']
+                    if stock_code not in self.stock_pool:
+                        position_stock_codes.append(stock_code)
+                        logger.debug(f"{GREEN}【持仓股票】{RESET} 股票:{stock_code} 持仓数量:{position['持仓数量']}")
             
             # 合并策略池和持仓股票
             subscribe_stocks = list(set(self.stock_pool + position_stock_codes))
@@ -172,10 +245,18 @@ class YiJinErDiXiStrategy:
                             return
                             
                         # 获取最新的K线数据
-                        bar_data = bar_list[-1]
+                        raw_bar_data = bar_list[-1]
+                        
+                        # 规范化K线数据
+                        bar_data = self._normalize_bar_data(raw_bar_data)
                         
                         # 转换时间戳为datetime对象
-                        current_time = pd.to_datetime(bar_data['time'], unit='ms')
+                        try:
+                            current_time = pd.to_datetime(bar_data['time'], unit='ms')
+                        except (ValueError, TypeError):
+                            # 如果时间戳转换失败，使用当前时间
+                            current_time = datetime.now()
+                            logger.warning(f"{YELLOW}【时间戳转换失败】{RESET} 股票:{stock_code} 使用当前时间")
                         
                         # 获取当前分钟时间（去掉秒和微秒）
                         current_minute = current_time.replace(second=0, microsecond=0)
@@ -247,7 +328,10 @@ class YiJinErDiXiStrategy:
             
             # 检查是否持有该股票
             position = self.context.get_position(stock_code)
-            has_position = position and position['持仓数量'] > 0
+            # 安全地检查持仓状态
+            has_position = False
+            if position is not None:
+                has_position = position.get('持仓数量', 0) > 0
             
             # 如果不在股票池中且没有持仓，则跳过处理
             if stock_code not in self.stock_pool and not has_position:
@@ -268,10 +352,10 @@ class YiJinErDiXiStrategy:
             # 更新涨停价缓存
             self.update_limit_up_cache(stock_code)
             
-            # 判断是否为开盘第一分钟
+            # # 判断是否为开盘第一分钟
             is_first_minute = bar_time.hour == 9 and bar_time.minute == 31
             
-            # 处理持仓股票的卖出信号
+            # # 处理持仓股票的卖出信号
             if has_position:
                 # 开盘第一分钟判断次日开盘卖出条件
                 if is_first_minute:
@@ -286,7 +370,11 @@ class YiJinErDiXiStrategy:
             # 处理股票池中的买入信号
             if stock_code in self.stock_pool and not has_position:
                 self.check_buy_signal(stock_code, bar_data)
-            
+                
+            # 每分钟检查一次超时订单
+            if bar_time.second == 0:
+                self.check_timeout_orders()
+
         except Exception as e:
             logger.error(f"{RED}【行情处理异常】{RESET} 股票:{stock_code} 错误:{e}")
             traceback.print_exc()
@@ -325,7 +413,10 @@ class YiJinErDiXiStrategy:
         self._ensure_cache_initialized(self.avg_price_cache, stock_code)
         
         # 计算分时均价 = 当日累计成交金额 ÷ 当日累计成交股数
-        avg_price = bar_data.amount / bar_data.volume if bar_data.volume > 0 else 0
+        # 注意：volume可能是以"手"为单位(1手=100股)，而amount是以"元"为单位
+        # 因此需要将volume乘以100转换为股数
+        volume_in_shares = bar_data.volume * 100 if bar_data.volume > 0 else 0
+        avg_price = bar_data.amount / volume_in_shares if volume_in_shares > 0 else 0
         
         # 缓存分时均价
         self.avg_price_cache[stock_code][current_date] = avg_price
@@ -594,6 +685,12 @@ class YiJinErDiXiStrategy:
         try:
             # 检查可用资金
             asset = self.context.get_asset()
+            
+            # 检查asset是否为None，如果是则记录日志并返回False
+            if asset is None:
+                logger.error(f"{RED}【获取资产失败】{RESET} 无法获取账户资产信息")
+                return False
+                
             available_cash = asset['可用金额']
             total_asset = asset['总资产']
             
@@ -645,7 +742,10 @@ class YiJinErDiXiStrategy:
             )
             
             if order_result and order_result.get('订单编号'):
-                logger.info(f"{GREEN}【买入信号】{RESET} 股票:{stock_code} 名称:{stock_name} 参考价格:{price:.2f} 金额:{BUY_AMOUNT:.2f} 次数:{buy_times} 委托方式:市价 订单编号:{order_result.get('订单编号')}")
+                order_id = order_result.get('订单编号')
+                # 记录订单信息
+                self.add_active_order(order_id, stock_code, '买入')
+                logger.info(f"{GREEN}【买入信号】{RESET} 股票:{stock_code} 名称:{stock_name} 参考价格:{price:.2f} 金额:{BUY_AMOUNT:.2f} 次数:{buy_times} 委托方式:市价 订单编号:{order_id}")
                 return True
             else:
                 logger.warning(f"{YELLOW}【买入失败】{RESET} 股票:{stock_code} 名称:{stock_name} 参考价格:{price:.2f} 金额:{BUY_AMOUNT:.2f} 委托方式:市价 返回结果:{order_result}")
@@ -718,7 +818,10 @@ class YiJinErDiXiStrategy:
             )
             
             if order_result and order_result.get('订单编号'):
-                logger.info(f"{YELLOW}【卖出信号】{RESET} 股票:{stock_code} 名称:{stock_name} 参考价格:{price:.2f} 委托价格:{limit_price if limit_price > 0 else '市价'} 数量:{sell_shares} 比例:{ratio:.2%} 次数:{sell_times} 委托方式:{price_type} 订单编号:{order_result.get('订单编号')}")
+                order_id = order_result.get('订单编号')
+                # 记录订单信息
+                self.add_active_order(order_id, stock_code, '卖出')
+                logger.info(f"{YELLOW}【卖出信号】{RESET} 股票:{stock_code} 名称:{stock_name} 参考价格:{price:.2f} 委托价格:{limit_price if limit_price > 0 else '市价'} 数量:{sell_shares} 比例:{ratio:.2%} 次数:{sell_times} 委托方式:{price_type} 订单编号:{order_id}")
                 return True
             else:
                 logger.warning(f"{YELLOW}【卖出失败】{RESET} 股票:{stock_code} 名称:{stock_name} 参考价格:{price:.2f} 委托价格:{limit_price if limit_price > 0 else '市价'} 数量:{sell_shares} 委托方式:{price_type} 返回结果:{order_result}")
@@ -745,4 +848,162 @@ class YiJinErDiXiStrategy:
         if date is not None and date not in cache_dict[stock_code]:
             if default is None:
                 default = {}
-            cache_dict[stock_code][date] = default if not isinstance(default, list) else [] 
+            cache_dict[stock_code][date] = default if not isinstance(default, list) else []
+    
+    def add_active_order(self, order_id, stock_code, order_type):
+        """
+        添加活跃订单记录
+        
+        Args:
+            order_id: 订单编号
+            stock_code: 股票代码
+            order_type: 订单类型，'买入'或'卖出'
+            
+        Returns:
+            None
+        """
+        if order_id:
+            self.active_orders[order_id] = {
+                'time': datetime.now(),
+                'stock_code': stock_code,
+                'order_type': order_type
+            }
+            logger.debug(f"{BLUE}【订单记录】{RESET} 添加{order_type}订单 ID:{order_id} 股票:{stock_code}")
+    
+    def remove_active_order(self, order_id):
+        """
+        移除活跃订单记录
+        
+        Args:
+            order_id: 订单编号
+            
+        Returns:
+            bool: 是否成功移除
+        """
+        if order_id in self.active_orders:
+            order_info = self.active_orders.pop(order_id)
+            logger.debug(f"{BLUE}【订单记录】{RESET} 移除{order_info['order_type']}订单 ID:{order_id} 股票:{order_info['stock_code']}")
+            return True
+        return False
+    
+    def check_timeout_orders(self):
+        """
+        检查超时未成交订单并撤单
+        
+        检查所有活跃订单，如果超过设定的超时时间未成交，则执行撤单操作
+        
+        Returns:
+            int: 撤单数量
+        """
+        if not self.active_orders:
+            return 0
+            
+        now = datetime.now()
+        cancel_count = 0
+        orders_to_cancel = []
+        
+        # 找出所有超时的订单
+        for order_id, order_info in self.active_orders.items():
+            order_time = order_info['time']
+            elapsed_seconds = (now - order_time).total_seconds()
+            
+            if elapsed_seconds >= self.order_timeout:
+                orders_to_cancel.append(order_id)
+        
+        # 执行撤单
+        for order_id in orders_to_cancel:
+            order_info = self.active_orders[order_id]
+            stock_code = order_info['stock_code']
+            order_type = order_info['order_type']
+            
+            try:
+                # 执行撤单
+                cancel_result = self.context.cancel_order(order_id)
+                
+                if cancel_result:
+                    logger.info(f"{YELLOW}【超时撤单】{RESET} {order_type}订单 ID:{order_id} 股票:{stock_code} 超时:{self.order_timeout}秒")
+                    self.remove_active_order(order_id)
+                    cancel_count += 1
+                else:
+                    logger.warning(f"{YELLOW}【撤单失败】{RESET} {order_type}订单 ID:{order_id} 股票:{stock_code}")
+            except Exception as e:
+                logger.error(f"{RED}【撤单异常】{RESET} 订单ID:{order_id} 错误:{e}")
+                traceback.print_exc()
+        
+        return cancel_count
+    
+    def process_order_callback(self, order):
+        """
+        处理订单回调
+        
+        当收到订单状态变化推送时调用，用于更新订单状态
+        
+        Args:
+            order: 订单信息
+        """
+        try:
+            order_id = order.get('委托编号') or order.get('order_id')
+            if not order_id:
+                return
+                
+            order_status = order.get('委托状态') or order.get('order_status')
+            
+            # 如果订单已成交、已撤单或已拒绝，从活跃订单中移除
+            if order_status in ['已成交', '已撤单', '已拒绝', '部撤', '部成']:
+                self.remove_active_order(order_id)
+                
+        except Exception as e:
+            logger.error(f"{RED}【订单回调处理异常】{RESET} 错误:{e}")
+            traceback.print_exc()
+    
+    def process_trade_callback(self, trade):
+        """
+        处理成交回调
+        
+        当收到成交信息推送时调用，用于更新订单状态
+        
+        Args:
+            trade: 成交信息
+        """
+        try:
+            order_id = trade.get('委托编号') or trade.get('order_id')
+            if not order_id:
+                return
+                
+            # 从活跃订单中移除
+            self.remove_active_order(order_id)
+                
+        except Exception as e:
+            logger.error(f"{RED}【成交回调处理异常】{RESET} 错误:{e}")
+            traceback.print_exc()
+    
+    def setup_tasks(self):
+        """
+        设置定时任务
+        
+        设置定期检查超时订单的定时任务
+        """
+        try:
+            # 每30秒检查一次超时订单
+            self.context.run_time(self.timer_check_timeout_orders, "30nSecond")
+            logger.info(f"{GREEN}【定时任务】{RESET} 设置超时订单检查任务，间隔:30秒")
+        except Exception as e:
+            logger.error(f"{RED}【定时任务设置失败】{RESET} 错误:{e}")
+            traceback.print_exc()
+    
+    def timer_check_timeout_orders(self):
+        """
+        定时检查超时订单
+        
+        定时任务回调函数，用于检查超时订单并执行撤单
+        """
+        if not is_trade_time():
+            return
+            
+        try:
+            cancel_count = self.check_timeout_orders()
+            if cancel_count > 0:
+                logger.info(f"{YELLOW}【定时撤单】{RESET} 已撤销{cancel_count}个超时订单")
+        except Exception as e:
+            logger.error(f"{RED}【定时撤单异常】{RESET} 错误:{e}")
+            traceback.print_exc() 

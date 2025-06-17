@@ -34,7 +34,6 @@ config.py
 *.tmp
 *.bak
 *.swp
-*.dmp
 
 # OS specific files
 .DS_Store

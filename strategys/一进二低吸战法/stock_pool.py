@@ -38,22 +38,6 @@ def is_st_stock(stock_name):
     return 'ST' in stock_name or '*ST' in stock_name
 
 
-def is_market_open():
-    """判断当前是否为交易时段"""
-    now = datetime.now()
-    
-    # 判断是否为周末
-    if now.weekday() >= 5:
-        return False
-    
-    # 判断是否在交易时间段内
-    current_time = now.time()
-    morning_session = time(9, 30, 0) <= current_time <= time(11, 30, 0)
-    afternoon_session = time(13, 0, 0) <= current_time <= time(15, 0, 0)
-    
-    return morning_session or afternoon_session
-
-
 def filter_stock_pool(context, batch_download_success=True):
     """
     根据选股条件筛选股票池
@@ -68,15 +52,6 @@ def filter_stock_pool(context, batch_download_success=True):
     # 获取沪深A股股票列表
     all_stocks = context.get_stock_list_in_sector("沪深A股")
     selected_stocks = []
-    
-    # 判断当前是否为交易时段
-    is_market_open_now = is_market_open()
-    
-    # 确定数据获取策略
-    if is_market_open_now:
-        logger.info(f"{BLUE}【选股策略】{RESET} 当前为交易时段，将使用上一根K线数据作为选股依据")
-    else:
-        logger.info(f"{BLUE}【选股策略】{RESET} 当前为非交易时段，将使用最新K线数据作为选股依据")
     
     # 开始筛选股票
     logger.info(f"{GREEN}【选股开始】{RESET} 正在筛选符合一进二低吸战法条件的股票...")
@@ -121,18 +96,14 @@ def filter_stock_pool(context, batch_download_success=True):
             daily_data['pct_change'] = (daily_data['close'] - daily_data['pre_close']) / daily_data['pre_close']
             daily_data['vol_prev'] = daily_data['volume'].shift(1)
             
-            # 获取"昨天"的数据
-            yesterday_index = -2 if is_market_open_now else -1
-            if abs(yesterday_index) > len(daily_data):
-                continue
-                
-            yesterday_data = daily_data.iloc[yesterday_index]
-            yesterday_date = daily_data.index[yesterday_index]
+            # 获取最后一个交易日的数据（无论是否在交易时段）
+            yesterday_data = daily_data.iloc[-1]
+            yesterday_date = daily_data.index[-1]
             
             # 条件1：判断是否涨停
             # 优先使用涨停价判断，涨停价无效时使用涨幅判断
             is_limit_up = False
-            if up_stop_price > 0:
+            if up_stop_price > 0 and False:
                 is_limit_up = abs(yesterday_data['close'] - up_stop_price) < 0.01
             else:
                 is_limit_up = yesterday_data['pct_change'] >= 0.095
@@ -142,16 +113,16 @@ def filter_stock_pool(context, batch_download_success=True):
                 continue
                 
             # 条件2：近3个交易日内的首次涨停
-            recent_end_idx = daily_data.index.get_loc(daily_data.index[yesterday_index]) + 1
+            recent_end_idx = len(daily_data)
             recent_start_idx = max(0, recent_end_idx - FIRST_LIMIT_UP_DAYS)
             recent_data = daily_data.iloc[recent_start_idx:recent_end_idx]
             
             # 计算涨停次数 - 需要使用涨幅判断，因为涨停价是变化的
-            # 昨天已经是涨停了，所以初始计数为1
+            # 最后一天已经是涨停了，所以初始计数为1
             limit_up_count = 1
             
             # 检查前面的日期是否也有涨停
-            for i in range(recent_start_idx, recent_end_idx - 1):  # 不包括昨天，因为已经知道昨天涨停
+            for i in range(recent_start_idx, recent_end_idx - 1):  # 不包括最后一天，因为已经知道最后一天涨停
                 current_row = daily_data.iloc[i]
                 # 使用涨幅判断涨停，一般认为9.5%以上就是涨停
                 if current_row['pct_change'] >= 0.095:
@@ -161,8 +132,8 @@ def filter_stock_pool(context, batch_download_success=True):
             if limit_up_count > 1:
                 continue
                 
-            # 条件3：昨天收盘价是近30个交易日的最高价
-            high_end_idx = daily_data.index.get_loc(daily_data.index[yesterday_index]) + 1
+            # 条件3：最后一个交易日收盘价是近30个交易日的最高价
+            high_end_idx = len(daily_data)
             high_start_idx = max(0, high_end_idx - NEW_HIGH_DAYS)
             high_data = daily_data.iloc[high_start_idx:high_end_idx]
             
